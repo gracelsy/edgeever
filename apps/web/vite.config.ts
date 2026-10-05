@@ -1,4 +1,5 @@
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 import { resolveDeploymentBuildMetadata } from "@edgeever/shared/deployment-metadata";
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -138,11 +139,13 @@ export default defineConfig({
     __EDGEEVER_DESKTOP_BUILD__: JSON.stringify(isDesktopBuild),
   },
   plugins: [
+    tailwindcss(),
     localDevelopmentAuth(),
     developmentServiceWorkerReset,
     react(),
     VitePWA({
       registerType: "autoUpdate",
+      includeAssets: [],
       includeManifestIcons: false,
       manifest: {
         name: "EdgeEver",
@@ -175,29 +178,12 @@ export default defineConfig({
         ],
       },
       workbox: {
-        globPatterns: ["**/*.{js,css,html,ico,png,svg,webp,woff2}"],
+        // Install-time precache excludes the app shell. The plugin still
+        // injects the web manifest so the app stays installable; other
+        // caches fill on first use.
+        globPatterns: [],
+        globIgnores: ["**/*"],
         cleanupOutdatedCaches: true,
-        additionalManifestEntries: [
-          {
-            revision: buildId,
-            url: `/index.html?edgeever-offline-shell=${encodeURIComponent(buildId)}`,
-          },
-        ],
-        globIgnores: [
-          "index.html",
-          // Noto Sans SC is used only by the on-demand print entry. Precaching every
-          // CJK unicode-range shard adds ~4.5 MiB to every PWA installation.
-          "**/noto-sans-sc-*.woff2",
-          "**/*beautiful-mermaid*.js",
-          "**/*mermaid.core-*.js",
-          "**/vendor-mermaid-*.js",
-          "**/*Diagram-*.js",
-          "**/vendor-codemirror-*.js",
-          // PDF.js is loaded only when a PDF preview or thumbnail is rendered.
-          // Keep its runtime out of the install-time app-shell precache and cache
-          // it after first use instead.
-          "**/vendor~pdf-*.js",
-        ],
         navigateFallback: null,
         navigationPreload: true,
         runtimeCaching: [
@@ -211,9 +197,6 @@ export default defineConfig({
               networkTimeoutSeconds: 5,
               cacheableResponse: {
                 statuses: [0, 200],
-              },
-              precacheFallback: {
-                fallbackURL: `/index.html?edgeever-offline-shell=${encodeURIComponent(buildId)}`,
               },
             },
           },
@@ -232,7 +215,18 @@ export default defineConfig({
             },
           },
           {
-            urlPattern: ({ url }) => /\/assets\/(?:.*beautiful-mermaid|vendor-mermaid|.*mermaid\.core|.*Diagram-|vendor-codemirror)/.test(url.pathname),
+            urlPattern: ({ url }) => /\/assets\/i18n-ja-/.test(url.pathname),
+            handler: "CacheFirst",
+            options: {
+              cacheName: "edgeever-optional-locales",
+              expiration: {
+                maxEntries: 8,
+                maxAgeSeconds: 60 * 60 * 24 * 30,
+              },
+            },
+          },
+          {
+            urlPattern: ({ url }) => /\/assets\/(?:.*beautiful-mermaid|vendor-mermaid|.*mermaid\.core|.*Diagram-|vendor-x6|vendor-codemirror)/.test(url.pathname),
             handler: "CacheFirst",
             options: {
               cacheName: "edgeever-optional-diagrams",
@@ -283,14 +277,14 @@ export default defineConfig({
     emptyOutDir: true,
     // ELK is distributed as one ~1.6 MiB module by beautiful-mermaid. It is
     // loaded only when a diagram is rendered and is excluded from HTML
-    // modulepreload and PWA precache; verify-web-performance.mjs enforces
-    // those constraints for every chunk above Vite's default 500 KiB limit.
+    // modulepreload; verify-web-performance.mjs enforces those constraints
+    // for every chunk above Vite's default 500 KiB limit.
     chunkSizeWarningLimit: OPTIONAL_CHUNK_WARNING_LIMIT_KB,
     modulePreload: isDesktopBuild
       ? false
       : {
           resolveDependencies: (_filename, dependencies) => dependencies.filter((dependency) =>
-            !/(?:vendor-code-highlight|vendor-(?:mermaid|D3|tiptap|prosemirror|floating|codemirror|zod)|vendor-radix(?!-slot)|ui-primitives|ui-button-tooltip)/.test(dependency),
+            !/(?:vendor-code-highlight|vendor-(?:mermaid|D3|tiptap|prosemirror|floating|codemirror|x6|infographic|zod|streamdown)|vendor~(?:wasm|emacs-lisp)-|vendor-radix(?!-slot)|ui-primitives|ui-button-tooltip|i18n-ja-)/.test(dependency),
           ),
         },
     rolldownOptions: {
@@ -323,9 +317,33 @@ export default defineConfig({
               // inherit the highlighter as a startup dependency.
             },
             {
+              name: "i18n-ja",
+              test: /[\\/]i18n[\\/](?:resources[\\/])?ja\.ts$/,
+              priority: 41,
+            },
+            {
               name: "vendor-react",
               test: /node_modules[\\/](react|react-dom|scheduler|react-router)[\\/]/,
               priority: 40,
+            },
+            {
+              name: "vendor-x6",
+              test: /node_modules[\\/]@antv[\\/]x6[\\/]/,
+              priority: 39,
+              // X6 initializes registries and plugins through a cyclic module
+              // graph. Size-based splitting can evaluate clipboard storage
+              // before Config is initialized, crashing the lazy diagram editor.
+              // Keep the graph atomic and defer the resulting chunk instead.
+            },
+            {
+              name: "vendor-infographic",
+              test: /node_modules[\\/]@antv[\\/]infographic[\\/]/,
+              priority: 39,
+              // AntV Infographic registers its template and shape catalogs through
+              // internal registries. Size-based splitting across chunks breaks
+              // initialization order, causing registry map lookups (e.g. .set)
+              // to fail on undefined during chunk evaluation. Keep this graph
+              // atomic and leave the resulting chunk off the initial modulepreload.
             },
             {
               name: "vendor-prosemirror",
@@ -336,6 +354,17 @@ export default defineConfig({
               name: "vendor-codemirror",
               test: /[\\/]node_modules[\\/](?:@codemirror|@lezer|@uiw[\\/](?:react-)?codemirror|@uiw[\\/]codemirror-themes|codemirror)[\\/]/,
               priority: 37,
+            },
+            {
+              name: "vendor-streamdown",
+              test: /node_modules[\\/](?:streamdown|@streamdown|micromark|mdast|unist|remark|rehype|vfile|zwitch|longest-streak|character-entities|property-information|space-separated-tokens|comma-separated-tokens|html-void-elements|ccount|devlop|bail|trough|unified)[\\/]/,
+              priority: 35,
+              // Streamdown and the unified/micromark/mdast parser stack rely on
+              // tight cross-module references and top-level initializer functions
+              // (e.g. unist-util-is convert() called at import time by mdast-util-phrasing).
+              // Splitting these modules across chunks via maxSize or entriesAware causes
+              // circular chunk evaluation order issues where convert() is undefined.
+              // Keep the entire Streamdown parsing graph atomic.
             },
             {
               name: "vendor-tiptap-pm",

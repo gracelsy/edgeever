@@ -227,6 +227,7 @@ describe("Cloudflare deployment entrypoints", () => {
 
   test("rejects instance-specific values in the repository Wrangler config", () => {
     const repositoryConfig = readRepositoryFile("wrangler.toml");
+    expect(repositoryConfig).toContain('[version_metadata]\nbinding = "CF_VERSION_METADATA"');
     const instanceConfigs = [
       repositoryConfig.replace('name = "edgeever"', 'name = "my-notes"'),
       repositoryConfig.replace("workers_dev = true", "workers_dev = false"),
@@ -456,7 +457,13 @@ describe("Cloudflare deployment entrypoints", () => {
     expect(workflow).not.toContain("force_redeploy:");
     expect(workflow).toContain("bun run db:migrate:local");
     expect(bunConfig).toContain('pathIgnorePatterns = ["tests/e2e/**"]');
-    expect(scripts.test).toBe("bun test --path-ignore-patterns='tests/e2e/**'");
+    expect(scripts.test).toBe("bun run test:bulk && bun run test:integration");
+    expect(scripts["test:bulk"]).toContain("--path-ignore-patterns='tests/e2e/**'");
+    expect(scripts["test:bulk"]).toContain("apps/api/src/companion-learning.test.mjs");
+    expect(scripts["test:bulk"]).toContain("apps/api/src/resource-upload-integration.test.mjs");
+    expect(scripts["test:integration"]).toBe(
+      "bun test apps/api/src/companion-learning.test.mjs apps/api/src/resource-upload-integration.test.mjs",
+    );
     expect(workflow).toContain("bun run test");
     expect(workflow.match(/if: steps\.upstream\.outputs\.align_mode == 'merge'/g)).toHaveLength(2);
     expect(workflow).toContain("git push origin HEAD:main");
@@ -835,6 +842,8 @@ describe("Cloudflare deployment entrypoints", () => {
   test("public deployment documentation exposes only Fork and Agent paths", () => {
     const englishReadme = readRepositoryFile("README.md");
     const chineseReadme = readRepositoryFile("README.zh-CN.md");
+    const traditionalChineseReadme = readRepositoryFile("README.zh-TW.md");
+    const japaneseReadme = readRepositoryFile("README.ja.md");
 
     expect(englishReadme).not.toContain("deploy.workers.cloudflare.com");
     expect(englishReadme).not.toContain("Option C: Manual Deployment");
@@ -842,6 +851,12 @@ describe("Cloudflare deployment entrypoints", () => {
     expect(chineseReadme).not.toContain("deploy.workers.cloudflare.com");
     expect(chineseReadme).not.toContain("方案 C：手动部署");
     expect(chineseReadme).toContain("Fork https://github.com/tianma-if/edgeever");
+    expect(traditionalChineseReadme).not.toContain("deploy.workers.cloudflare.com");
+    expect(traditionalChineseReadme).not.toContain("方案 C：手動部署");
+    expect(traditionalChineseReadme).toContain("Fork https://github.com/tianma-if/edgeever");
+    expect(japaneseReadme).not.toContain("deploy.workers.cloudflare.com");
+    expect(japaneseReadme).not.toContain("方案 C：手動導入");
+    expect(japaneseReadme).toContain("Fork https://github.com/tianma-if/edgeever");
   });
 
   test("product site deployment prompts mirror the root READMEs", () => {

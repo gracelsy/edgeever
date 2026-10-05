@@ -3,6 +3,9 @@ import {
   DEFAULT_MEMO_TITLE,
   docToText,
   markdownToDoc,
+  getDiagramSummary,
+  getInfographicSummary,
+  getTableSummary,
   type MemoSummary,
 } from "@edgeever/shared";
 import { parseJsonArray } from "./entity-utils";
@@ -68,6 +71,9 @@ export const mapMemoSummary = (row: MemoSummaryRow): MemoSummary => ({
     row.excerpt ||
     createExcerpt(row.content_text ?? "") ||
     createExcerpt(docToText(markdownToDoc(row.content_markdown ?? ""))),
+  ...getDiagramSummary(row.content_markdown),
+  ...getInfographicSummary(row.content_markdown),
+  ...getTableSummary(row.content_markdown),
   tags: parseJsonArray(row.tags_json),
   isPinned: Boolean(row.is_pinned),
   isArchived: Boolean(row.is_archived),

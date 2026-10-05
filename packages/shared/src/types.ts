@@ -1,5 +1,9 @@
 import type { TiptapDoc } from "./content";
 import type { AiAction, AiPromptParameterKind, AiPromptResultMode } from "./ai-assistant";
+import type { DiagramKind, DiagramSummaryPreview } from "./diagram";
+import type { TableSummaryPreview } from "./table";
+
+export type NoteCreateKind = DiagramKind | "infographic" | "table";
 
 export type Notebook = {
   id: string;
@@ -20,6 +24,11 @@ export type MemoSummary = {
   notebookId: string;
   title: string | null;
   excerpt: string;
+  diagramKind?: DiagramKind | null;
+  diagramPreview?: DiagramSummaryPreview;
+  structuredTable?: boolean;
+  tablePreview?: TableSummaryPreview;
+  infographic?: boolean;
   tags: string[];
   isPinned: boolean;
   isArchived: boolean;
@@ -50,6 +59,24 @@ export type MemoTemplate = {
   tags: string[];
   createdAt: string;
   updatedAt: string;
+};
+
+export type WorkspaceExtensionSourceKind = "marketplace" | "github" | "manifest";
+
+export type WorkspaceExtension = {
+  extensionId: string;
+  type: "plugin" | "theme";
+  version: string;
+  enabled: boolean;
+  installedAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+  manifestUrl: string;
+  sourceKind: WorkspaceExtensionSourceKind;
+  verified: boolean;
+  repositoryUrl: string | null;
+  releaseTag: string | null;
+  publisher: "edgeever" | null;
 };
 
 export type ScheduledTaskMissedRunPolicy = "run-once" | "skip";
@@ -169,13 +196,12 @@ export type AiProviderConfig = {
   isEnabled: boolean;
   hasApiKey: boolean;
   models: AiModelConfig[];
+  credentialsUnavailable?: boolean;
 };
 
 export type AiSettings = {
   providers: AiProviderConfig[];
   defaultModelId: string | null;
-  tagSuggestionPrompt: string;
-  tagSuggestionPromptCustomized: boolean;
   encryptionConfigured: boolean;
   readOnly: boolean;
 };

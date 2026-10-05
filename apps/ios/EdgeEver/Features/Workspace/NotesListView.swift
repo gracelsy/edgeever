@@ -7,6 +7,7 @@ struct NotesListView: View {
     @Binding var path: NavigationPath
     var onCreateNote: (() -> Void)? = nil
     var onCreateFromTemplate: (() -> Void)? = nil
+    var onCreateNotebook: (() -> Void)? = nil
 
     /// Whole-list settle + Pow jump once when data first becomes available this session.
     @State private var listEntranceSettled = false
@@ -61,14 +62,20 @@ struct NotesListView: View {
                 emptyCard(
                     title: env.preferences.t("暂无笔记本", en: "No notebooks"),
                     description: env.preferences.t(
-                        "同步完成后，笔记本会出现在这里。可在桌面/Web 端创建笔记本。",
-                        en: "Notebooks appear after sync. Create them on desktop/web."
+                        "先创建一个笔记本，再开始记录。",
+                        en: "Create a notebook to start taking notes.",
+                        ja: "ノートブックを作成して記録を始めましょう。"
                     ),
-                    showCreate: false
+                    showCreate: false,
+                    showCreateNotebook: true
                 )
                 .transition(Motion.softFade)
             } else if store.memos.isEmpty && !store.isLoadingList {
-                emptyCard(title: emptyTitle, description: emptyDescription, showCreate: store.searchText.isEmpty && store.filter == .all)
+                emptyCard(
+                    title: emptyTitle,
+                    description: emptyDescription,
+                    showCreate: store.searchText.isEmpty && store.filter == .all && store.selectedTag == nil
+                )
                     .transition(Motion.softFade)
             } else {
                 ScrollViewReader { proxy in
@@ -113,6 +120,7 @@ struct NotesListView: View {
                         .padding(.bottom, 18)
                         .animation(Motion.listContent, value: store.memos.map(\.id))
                         .animation(Motion.listContent, value: store.filter)
+                        .animation(Motion.listContent, value: store.selectedTag)
                         .animation(Motion.listContent, value: store.searchText)
                         .animation(Motion.search, value: hasBootstrapProgress)
                     }
@@ -389,21 +397,43 @@ struct NotesListView: View {
         }
     }
 
+    /// With sub-notebooks hidden, an empty parent must not look like its notes are gone.
+    private var hiddenDescendantMemoCount: Int {
+        guard !env.preferences.showDescendantNotes,
+              store.searchText.trimmingCharacters(in: .whitespaces).isEmpty,
+              store.filter == .all,
+              store.selectedTag == nil,
+              let notebookId = store.selectedNotebookId
+        else { return 0 }
+        return NotebookHierarchy.descendantMemoCount(notebooks: store.notebooks, targetNotebookId: notebookId)
+    }
+
     private var emptyTitle: String {
+        if hiddenDescendantMemoCount > 0 {
+            return env.preferences.t("本级暂无笔记", en: "No notes directly in this notebook", ja: "このノートブック直下にノートはありません")
+        }
         if !store.searchText.trimmingCharacters(in: .whitespaces).isEmpty {
             return env.preferences.t("没有找到匹配笔记", en: "No matching notes")
         }
-        if store.filter != .all {
+        if store.filter != .all || store.selectedTag != nil {
             return env.preferences.t("没有符合筛选的笔记", en: "No notes match this filter")
         }
         return env.preferences.t("暂无笔记", en: "No notes yet")
     }
 
     private var emptyDescription: String {
+        let hiddenCount = hiddenDescendantMemoCount
+        if hiddenCount > 0 {
+            return env.preferences.t(
+                "子笔记本中还有 \(hiddenCount) 条笔记。可以打开子笔记本查看，或在设置中开启“父笔记本中显示子笔记本笔记”。",
+                en: "Its sub-notebooks still contain \(hiddenCount) notes. Open a sub-notebook to see them, or turn on \"Show notes from sub-notebooks\" in Settings.",
+                ja: "サブノートブックにはまだ \(hiddenCount) 件のノートがあります。サブノートブックを開くか、設定で「サブノートブックのノートを表示」をオンにしてください。"
+            )
+        }
         if !store.searchText.trimmingCharacters(in: .whitespaces).isEmpty {
             return env.preferences.t("换个关键词再试", en: "Try another keyword")
         }
-        if store.filter != .all {
+        if store.filter != .all || store.selectedTag != nil {
             return env.preferences.t("试试切换筛选条件，或调整搜索关键词。", en: "Try another filter or search.")
         }
         return env.preferences.t(
@@ -413,7 +443,7 @@ struct NotesListView: View {
     }
 
     /// Android `memoListEmptyCard` + `emptyTitle` / `mutedText` + dual create actions.
-    private func emptyCard(title: String, description: String, showCreate: Bool) -> some View {
+    private func emptyCard(title: String, description: String, showCreate: Bool, showCreateNotebook: Bool = false) -> some View {
         VStack(spacing: 10) {
             Text(title)
                 .font(.system(size: 16, weight: AppTheme.heavy))
@@ -422,6 +452,19 @@ struct NotesListView: View {
                 .font(.system(size: 13))
                 .foregroundStyle(AppTheme.secondary)
                 .multilineTextAlignment(.center)
+            if showCreateNotebook, let onCreateNotebook {
+                Button(action: onCreateNotebook) {
+                    Label(env.preferences.t("新建笔记本", en: "New notebook", ja: "新しいノートブック"), systemImage: "plus")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .frame(height: 38)
+                        .background(AppTheme.accent)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("emptyCreateNotebook")
+            }
             if showCreate, !store.notebooks.isEmpty {
                 HStack(spacing: 8) {
                     if let onCreateNote {
@@ -555,6 +598,7 @@ struct NotesListView: View {
                 density: density,
                 locale: env.preferences.resolvedLocale,
                 isEnglish: env.preferences.isEnglish,
+                language: env.preferences.uiLanguage,
                 sort: store.sort
             )
             .padding(density.cardPadding)
@@ -578,6 +622,7 @@ struct MemoCardContent: View {
     var density: ListDensity = .preview
     var locale: Locale = .current
     var isEnglish: Bool = false
+    var language: AppUILanguage = .chinese
     var sort: MemoSortMode = .updatedDesc
 
     var body: some View {
@@ -597,7 +642,7 @@ struct MemoCardContent: View {
             }
 
             if density.showsExcerpt {
-                Text(memo.excerpt.isEmpty ? (isEnglish ? "Empty note" : "空笔记") : memo.excerpt)
+                Text(memo.excerpt.isEmpty ? emptyNoteLabel : memo.excerpt)
                     .font(AppTheme.memoExcerptFont)
                     .foregroundStyle(AppTheme.body)
                     .lineLimit(2)
@@ -607,7 +652,7 @@ struct MemoCardContent: View {
             }
 
             HStack(alignment: .center, spacing: 8) {
-                Text("\(timestampLabel) \(MemoPreviewDate.format(timestampField.value(from: memo), locale: locale, isEnglish: isEnglish))")
+                Text("\(timestampLabel) \(MemoPreviewDate.format(timestampField.value(from: memo), locale: locale, isEnglish: isEnglish, language: language))")
                     .font(AppTheme.memoDateFont)
                     .foregroundStyle(AppTheme.meta)
                 ForEach(Array(memo.tags.prefix(3)), id: \.self) { tag in
@@ -627,7 +672,23 @@ struct MemoCardContent: View {
 
     private var displayTitle: String {
         let t = memo.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return t.isEmpty ? (isEnglish ? "Untitled note" : "无标题笔记") : t
+        return t.isEmpty ? untitledNoteLabel : t
+    }
+
+    private var emptyNoteLabel: String {
+        switch language {
+        case .japanese: return "空のノート"
+        case .english: return "Empty note"
+        case .chinese: return "空笔记"
+        }
+    }
+
+    private var untitledNoteLabel: String {
+        switch language {
+        case .japanese: return "無題のノート"
+        case .english: return "Untitled note"
+        case .chinese: return "无标题笔记"
+        }
     }
 
     private var timestampField: MemoListTimestampField {
@@ -636,8 +697,18 @@ struct MemoCardContent: View {
 
     private var timestampLabel: String {
         switch timestampField {
-        case .createdAt: isEnglish ? "Created" : "创建"
-        case .updatedAt: isEnglish ? "Updated" : "更新"
+        case .createdAt:
+            switch language {
+            case .japanese: return "作成"
+            case .english: return "Created"
+            case .chinese: return "创建"
+            }
+        case .updatedAt:
+            switch language {
+            case .japanese: return "更新"
+            case .english: return "Updated"
+            case .chinese: return "更新"
+            }
         }
     }
 }

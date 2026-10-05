@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { markdownToDoc } from "@edgeever/shared";
 import {
+  getWritableEditorMemoFields,
   resolveEditorDraftState,
   shouldReplaceEditorDocument,
 } from "./editor-draft-state.ts";
@@ -51,6 +53,30 @@ describe("editor draft source resolution", () => {
     expect(state.title).toBe("Remote");
     expect(state.contentMarkdown).toBe("remote body");
     expect(state.hasUnsavedChanges).toBe(false);
+  });
+
+  test("preserves stored markdown that a JSON roundtrip would collapse", () => {
+    const stored = "时代公馆\n\n\n*提示：表格*";
+    const state = resolveEditorDraftState({
+      memo: {
+        ...memo,
+        contentJson: markdownToDoc(stored),
+        contentMarkdown: stored,
+      },
+    });
+
+    expect(state.contentMarkdown).toBe(stored);
+  });
+
+  test("falls back to serialized markdown when the stored source is empty", () => {
+    const state = resolveEditorDraftState({
+      memo: {
+        ...memo,
+        contentMarkdown: "",
+      },
+    });
+
+    expect(state.contentMarkdown).toBe("remote body");
   });
 
   test("repairs invalid saved gallery images and marks the memo for autosave", () => {
@@ -141,6 +167,24 @@ describe("editor draft source resolution", () => {
     expect(state.hasUnsavedChanges).toBe(false);
   });
 
+  test("preserves queued markdown that a JSON roundtrip would collapse", () => {
+    const stored = "时代公馆\n\n\n*提示：表格*";
+    const state = resolveEditorDraftState({
+      memo,
+      queuedUpdate: {
+        ...queue,
+        payload: {
+          ...queue.payload,
+          contentJson: markdownToDoc(stored),
+          contentMarkdown: stored,
+        },
+      },
+    });
+
+    expect(state.source).toBe("queue");
+    expect(state.contentMarkdown).toBe(stored);
+  });
+
   test("keeps the draft authoritative while its update remains queued", () => {
     const state = resolveEditorDraftState({
       memo,
@@ -181,5 +225,33 @@ describe("editor document hydration", () => {
 
   test("hydrates when the current editor document cannot be read", () => {
     expect(shouldReplaceEditorDocument(null, doc("remote body"))).toBe(true);
+  });
+});
+
+describe("editor write ownership", () => {
+  test("rejects the previous note's title and tags while the editor switches notes", () => {
+    const previousFields = { memoId: "memo-a", title: "Title A", tagsText: "tag-a" };
+
+    expect(getWritableEditorMemoFields(previousFields, "memo-b", "memo-b", false)).toBeNull();
+    expect(getWritableEditorMemoFields(previousFields, "memo-b", "memo-a", false)).toBeNull();
+    expect(getWritableEditorMemoFields(previousFields, "memo-a", "memo-a", true)).toBeNull();
+  });
+
+  test("accepts a recovered old-format draft once all fields belong to its note", () => {
+    const recoveredMemo = { ...memo, id: "memo-b" };
+    const recovered = resolveEditorDraftState({
+      memo: recoveredMemo,
+      draft: {
+        memoId: recoveredMemo.id,
+        title: "Recovered B",
+        tagsText: "tag-b",
+        contentJson: doc("recovered body"),
+        updatedAt: "2026-01-04T00:00:00.000Z",
+      },
+    });
+    const fields = { memoId: recoveredMemo.id, title: recovered.title, tagsText: recovered.tagsText };
+
+    expect(getWritableEditorMemoFields(fields, recoveredMemo.id, recoveredMemo.id, false)).toEqual(fields);
+    expect(recovered.contentMarkdown).toBe("recovered body");
   });
 });

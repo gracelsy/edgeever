@@ -3,10 +3,35 @@ import {
   AiPromptTemplateUpdateSchema,
   TemplateCreateSchema,
   TemplateUpdateSchema,
+  compileInfographicNote,
+  DIAGRAM_DEFAULT_THEME,
+  docToText,
+  hasInfographicDocumentMarker,
+  INFOGRAPHIC_SCHEMA_VERSION,
+  infographicFallbackMarkdown,
+  infographicSyntaxTemplate,
   markdownToDoc,
+  addTableRecord,
+  createTableId,
+  getTableSummary,
+  TABLE_FIELD_LIMIT,
+  TABLE_RECORD_LIMIT,
+  TABLE_SCHEMA_VERSION,
+  hasTableDocumentMarker,
+  parseDiagramDocument,
+  parseInfographicDocument,
+  parseTableDocument,
+  removeTableRecord,
+  serializeDiagramDocument,
+  serializeInfographicDocument,
+  serializeTableDocument,
+  stripInfographicDocumentMarker,
+  tableFallbackMarkdown,
+  updateTableCell,
   type MemoDetail,
   type MemoSummary,
   type MemoUpdateInput,
+  type TableDocument,
 } from "@edgeever/shared";
 import { audit, auditStatement } from "./audit";
 import type { AppContext, AuditActor, AuthContext, Bindings } from "./api-context";
@@ -22,6 +47,21 @@ import {
   getRequiredString,
   getRequiredStringArray,
 } from "./mcp-json-rpc";
+import {
+  applyTableSchemaOperations,
+  ensureUniqueTableFieldName,
+  memoWithoutTablePayload,
+  requiredTableRevision,
+  tableCellPatch,
+  tableFieldInput,
+  tableSchemaImpact,
+} from "./mcp-table-tools";
+import {
+  applyDiagramOperations,
+  diagramSemanticGraph,
+  memoWithoutDiagramPayload,
+  parseDiagramMemoIr,
+} from "./mcp-diagram-tools";
 import {
     getMemoRevisionRow as getMemoRevisionRowService,
     listMemoRevisions as listMemoRevisionsService,
@@ -71,7 +111,7 @@ export type McpToolDependencies = {
   createMemoRecord: (
     database: DatabaseAdapter,
     workspaceId: string,
-    input: { notebookId: string; title?: string; contentMarkdown?: string; tags?: string[]; createdAt?: string; updatedAt?: string },
+    input: { notebookId: string; title?: string; contentJson?: unknown; contentMarkdown?: string; tags?: string[]; createdAt?: string; updatedAt?: string },
     actor: AuditActor,
     actorLabel: string,
   ) => Promise<MemoDetail>;
@@ -192,6 +232,12 @@ const assertMcpMutationAllowed = (environment: Bindings) => {
   }
 };
 
+const memoWithoutInfographicPayload = (memo: MemoDetail) => {
+  const contentMarkdown = stripInfographicDocumentMarker(memo.contentMarkdown);
+  const contentJson = markdownToDoc(contentMarkdown);
+  return { ...memo, contentMarkdown, contentJson, contentText: docToText(contentJson) };
+};
+
 export const callMcpTool = async (
   c: AppContext,
   auth: AuthContext,
@@ -258,7 +304,144 @@ export const callMcpTool = async (
         throw new Error("Memo not found");
       }
 
+      const diagram = parseDiagramDocument(memo.contentMarkdown);
+      if (diagram) return { memo: memoWithoutDiagramPayload(memo), diagram: diagramSemanticGraph(diagram) };
+      const table = parseTableDocument(memo.contentMarkdown);
+      if (table) return { memo: memoWithoutTablePayload(memo), structuredTable: getTableSummary(memo.contentMarkdown).tablePreview };
+      const infographic = parseInfographicDocument(memo.contentMarkdown);
+      if (infographic) {
+        return {
+          memo: memoWithoutInfographicPayload(memo),
+          infographic: { template: infographicSyntaxTemplate(infographic.syntax) },
+        };
+      }
       return { memo };
+    }
+    case "get_table_records": {
+      assertScope(auth, "read:memos");
+      const memoId = getRequiredString(args.memoId, "memoId");
+      const memo = await getMemoDetail(c.env.storage.db, auth.workspaceId, memoId);
+      if (!memo) throw new AppError("not_found", "Memo not found", 404);
+      const document = parseTableDocument(memo.contentMarkdown);
+      if (!document) throw new AppError("not_table", "Memo is not a structured table", 400);
+      const recordId = getOptionalString(args.recordId);
+      const offset = clampNumber(Number(args.offset ?? 0), 0, document.records.length);
+      const limit = clampNumber(Number(args.limit ?? 50), 1, 100);
+      const record = recordId ? document.records.find((item) => item.id === recordId) : undefined;
+      if (recordId && !record) throw new AppError("not_found", "Table record not found", 404);
+      return {
+        memoId,
+        revision: memo.revision,
+        fields: document.fields,
+        records: record ? [record] : document.records.slice(offset, offset + limit),
+        totalRecords: document.records.length,
+        ...(recordId ? {} : { offset, limit }),
+      };
+    }
+    case "create_table_memo": {
+      assertScope(auth, "write:memos");
+      const notebookId = getRequiredString(args.notebookId, "notebookId");
+      const title = getRequiredString(args.title, "title");
+      if (title.length > 160) throw new AppError("invalid_params", "title must have at most 160 characters", 400);
+      if (!Array.isArray(args.fields) || args.fields.length < 1 || args.fields.length > TABLE_FIELD_LIMIT) {
+        throw new AppError("invalid_params", `fields must include 1–${TABLE_FIELD_LIMIT} fields`, 400);
+      }
+      const document: TableDocument = { schemaVersion: TABLE_SCHEMA_VERSION, fields: [], records: [], view: { filters: [], sort: null } };
+      for (const value of args.fields) {
+        const field = tableFieldInput(value);
+        ensureUniqueTableFieldName(document, field.name);
+        document.fields.push(field);
+      }
+      const memo = await createMemoRecord(c.env.storage.db, auth.workspaceId, {
+        notebookId,
+        title,
+        contentMarkdown: serializeTableDocument(document),
+        contentJson: markdownToDoc(tableFallbackMarkdown(document)),
+        tags: getOptionalStringArray(args.tags),
+      }, getAuditActor(c), getActorLabel(c));
+      return { memo: memoWithoutTablePayload(memo), fields: document.fields, revision: memo.revision };
+    }
+    case "update_table_schema": {
+      assertScope(auth, "write:memos");
+      const memoId = getRequiredString(args.memoId, "memoId");
+      const expectedRevision = requiredTableRevision(args.expectedRevision);
+      const memo = await getMemoDetail(c.env.storage.db, auth.workspaceId, memoId);
+      if (!memo) throw new AppError("not_found", "Memo not found", 404);
+      const document = parseTableDocument(memo.contentMarkdown);
+      if (!document) throw new AppError("not_table", "Memo is not a structured table", 400);
+      if (memo.revision !== expectedRevision) {
+        throw new AppError("revision_conflict", "Table changed since it was read. Read it again before writing.", 409);
+      }
+      const next = applyTableSchemaOperations(document, args.operations);
+      const impact = tableSchemaImpact(document, next);
+      if (args.dryRun === true) {
+        const oldIds = new Set(document.fields.map((field) => field.id));
+        return {
+          dryRun: true,
+          memoId,
+          revision: memo.revision,
+          fields: next.fields.map((field) => ({ ...field, id: oldIds.has(field.id) ? field.id : null })),
+          ...impact,
+        };
+      }
+      if (impact.changedCellCount > 0 && args.allowDataChanges !== true) {
+        throw new AppError("table_data_changes_required", `${impact.changedCellCount} existing cell values would change. Preview with dryRun, then pass allowDataChanges=true.`, 409);
+      }
+      const result = await updateMemoRecord(c.env.storage.db, auth.workspaceId, memoId, {
+        expectedRevision,
+        contentMarkdown: serializeTableDocument(next),
+        contentJson: markdownToDoc(tableFallbackMarkdown(next)),
+        tags: memo.tags,
+      }, getAuditActor(c), getActorLabel(c));
+      if (!("memo" in result)) throw new AppError(result.error, result.message, result.status ?? 409);
+      return { memoId, revision: result.memo.revision, fields: next.fields, ...impact };
+    }
+    case "add_table_record":
+    case "update_table_record":
+    case "delete_table_record": {
+      assertScope(auth, "write:memos");
+      const memoId = getRequiredString(args.memoId, "memoId");
+      const expectedRevision = requiredTableRevision(args.expectedRevision);
+      const memo = await getMemoDetail(c.env.storage.db, auth.workspaceId, memoId);
+      if (!memo) throw new AppError("not_found", "Memo not found", 404);
+      const document = parseTableDocument(memo.contentMarkdown);
+      if (!document) throw new AppError("not_table", "Memo is not a structured table", 400);
+      if (memo.revision !== expectedRevision) {
+        throw new AppError("revision_conflict", "Table changed since it was read. Read it again before writing.", 409);
+      }
+      let next = document;
+      let recordId: string;
+      if (name === "add_table_record") {
+        if (document.records.length >= TABLE_RECORD_LIMIT) throw new AppError("table_record_limit", "Table record limit reached", 409);
+        const cells = await tableCellPatch(c.env.storage.db, memoId, document, args.cells, true);
+        recordId = createTableId("rec");
+        next = addTableRecord(document, recordId);
+        for (const [fieldId, value] of Object.entries(cells)) next = updateTableCell(next, recordId, fieldId, value);
+      } else {
+        recordId = getRequiredString(args.recordId, "recordId");
+        if (!document.records.some((record) => record.id === recordId)) {
+          throw new AppError("not_found", "Table record not found", 404);
+        }
+        if (name === "update_table_record") {
+          const cells = await tableCellPatch(c.env.storage.db, memoId, document, args.cells, false);
+          for (const [fieldId, value] of Object.entries(cells)) next = updateTableCell(next, recordId, fieldId, value);
+        } else {
+          next = removeTableRecord(document, recordId);
+        }
+      }
+      const result = await updateMemoRecord(c.env.storage.db, auth.workspaceId, memoId, {
+        expectedRevision,
+        contentMarkdown: serializeTableDocument(next),
+        contentJson: markdownToDoc(tableFallbackMarkdown(next)),
+        tags: memo.tags,
+      }, getAuditActor(c), getActorLabel(c));
+      if (!("memo" in result)) throw new AppError(result.error, result.message, result.status ?? 409);
+      return {
+        memoId,
+        revision: result.memo.revision,
+        recordId,
+        ...(name === "delete_table_record" ? { deleted: true } : { record: next.records.find((item) => item.id === recordId) }),
+      };
     }
     case "create_memo": {
       assertScope(auth, "write:memos");
@@ -276,6 +459,101 @@ export const callMcpTool = async (
 
       return { memo };
     }
+    case "create_infographic_memo": {
+      assertScope(auth, "write:memos");
+      const notebookId = getRequiredString(args.notebookId, "notebookId");
+      const template = getRequiredString(args.template, "template");
+      const compiled = compileInfographicNote(template, args.data);
+      if (!compiled.ok) throw new AppError("invalid_params", compiled.message, 400);
+      const document = { schemaVersion: INFOGRAPHIC_SCHEMA_VERSION, syntax: compiled.syntax };
+      const memo = await createMemoRecord(c.env.storage.db, auth.workspaceId, {
+        notebookId,
+        title: getOptionalString(args.title) ?? compiled.title,
+        contentMarkdown: serializeInfographicDocument(document),
+        contentJson: markdownToDoc(infographicFallbackMarkdown(document)),
+        tags: getOptionalStringArray(args.tags),
+      }, getAuditActor(c), getActorLabel(c));
+      return {
+        memo: memoWithoutInfographicPayload(memo),
+        infographic: true,
+        template,
+        revision: memo.revision,
+      };
+    }
+    case "create_diagram_memo": {
+      assertScope(auth, "write:memos");
+      const notebookId = getRequiredString(args.notebookId, "notebookId");
+      const ir = parseDiagramMemoIr(args);
+      const { compileDiagramIr } = await import("@edgeever/shared/diagram-layout");
+      // Generated mind maps and flowcharts start with the editor's default
+      // theme even when an agent supplies an arbitrary color scheme.
+      const document = compileDiagramIr(ir.kind === "mind-map" || ir.kind === "flowchart"
+        ? { ...ir, theme: DIAGRAM_DEFAULT_THEME }
+        : ir);
+      const contentMarkdown = serializeDiagramDocument(document);
+      if (!parseDiagramDocument(contentMarkdown)) {
+        throw new AppError("invalid_params", "The diagram graph could not be compiled", 400);
+      }
+      const memo = await createMemoRecord(c.env.storage.db, auth.workspaceId, {
+        notebookId,
+        title: getOptionalString(args.title) ?? undefined,
+        contentMarkdown,
+        tags: getOptionalStringArray(args.tags),
+      }, getAuditActor(c), getActorLabel(c));
+
+      return {
+        memo: memoWithoutDiagramPayload(memo),
+        diagramKind: document.kind,
+        diagram: diagramSemanticGraph(document),
+      };
+    }
+    case "get_diagram": {
+      assertScope(auth, "read:memos");
+      const memoId = getRequiredString(args.memoId, "memoId");
+      const memo = await getMemoDetail(c.env.storage.db, auth.workspaceId, memoId);
+      if (!memo) throw new AppError("not_found", "Memo not found", 404);
+      const document = parseDiagramDocument(memo.contentMarkdown);
+      if (!document) throw new AppError("not_diagram", "Memo is not an editable diagram", 400);
+      return {
+        memo: { id: memo.id, title: memo.title, revision: memo.revision, updatedAt: memo.updatedAt },
+        diagram: diagramSemanticGraph(document, args.includeLayout === true),
+      };
+    }
+    case "update_diagram": {
+      assertScope(auth, "write:memos");
+      const memoId = getRequiredString(args.memoId, "memoId");
+      if (typeof args.expectedRevision !== "number" || !Number.isInteger(args.expectedRevision) || args.expectedRevision < 0) {
+        throw new AppError("invalid_params", "expectedRevision must be a non-negative integer", 400);
+      }
+      const memo = await getMemoDetail(c.env.storage.db, auth.workspaceId, memoId);
+      if (!memo) throw new AppError("not_found", "Memo not found", 404);
+      if (memo.revision !== args.expectedRevision) {
+        throw new AppError("revision_conflict", "Diagram was updated elsewhere. Read it again before applying operations.", 409);
+      }
+      const current = parseDiagramDocument(memo.contentMarkdown);
+      if (!current) throw new AppError("not_diagram", "Memo is not an editable diagram", 400);
+      const mutation = await applyDiagramOperations(args, current);
+      if (args.dryRun === true) {
+        return {
+          dryRun: true,
+          memo: { id: memo.id, title: memo.title, revision: memo.revision, updatedAt: memo.updatedAt },
+          changes: mutation.changes,
+          diagram: diagramSemanticGraph(mutation.document),
+        };
+      }
+      const result = await updateMemoRecord(c.env.storage.db, auth.workspaceId, memoId, {
+        expectedRevision: args.expectedRevision,
+        contentMarkdown: mutation.contentMarkdown,
+      }, getAuditActor(c), getActorLabel(c));
+      if (result.error !== undefined) {
+        throw new AppError(result.error, result.message, result.status ?? 400);
+      }
+      return {
+        memo: { id: result.memo.id, title: result.memo.title, revision: result.memo.revision, updatedAt: result.memo.updatedAt },
+        changes: mutation.changes,
+        diagram: diagramSemanticGraph(mutation.document),
+      };
+    }
     case "import_memos": {
       assertScope(auth, "write:memos");
       return await importMemosRecord(c.env.storage.db, auth.workspaceId, {
@@ -290,6 +568,30 @@ export const callMcpTool = async (
     case "update_memo": {
       assertScope(auth, "write:memos");
       const memoId = getRequiredString(args.memoId, "memoId");
+      if (args.contentMarkdown !== undefined) {
+        const existing = await getMemoDetail(c.env.storage.db, auth.workspaceId, memoId);
+        if (existing && parseDiagramDocument(existing.contentMarkdown)) {
+          throw new AppError(
+            "diagram_update_required",
+            "Diagram content cannot be replaced through update_memo. Use update_diagram for semantic changes.",
+            400,
+          );
+        }
+        if (existing && hasTableDocumentMarker(existing.contentMarkdown)) {
+          throw new AppError(
+            "table_update_required",
+            "Structured table content cannot be replaced through update_memo.",
+            400,
+          );
+        }
+        if (existing && hasInfographicDocumentMarker(existing.contentMarkdown)) {
+          throw new AppError(
+            "infographic_update_required",
+            "Infographic content cannot be replaced through update_memo.",
+            400,
+          );
+        }
+      }
       const actor = getAuditActor(c);
       const actorLabel = getActorLabel(c);
       const result = await updateMemoRecord(
